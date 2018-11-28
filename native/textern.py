@@ -28,6 +28,7 @@ class TmpManager():
             tmpdir_parent = None
         self.tmpdir = tempfile.mkdtemp(prefix="textern-", dir=tmpdir_parent)
         self._tmpfiles = {}  # relfn --> opaque
+        self._editors = {}  # absfn --> proc
 
     def __enter__(self):
         return self
@@ -64,6 +65,19 @@ class TmpManager():
     def has(self, relfn):
         return relfn in self._tmpfiles
 
+    def add_editor(self, absfn, proc):
+        relfn = os.path.basename(absfn)
+        assert relfn in self._tmpfiles
+        self._editors[absfn] = proc
+
+    def kill_editors(self):
+        """Terminate editors that aren't finished yet"""
+        for proc in self._editors.values():
+            proc.terminate()
+        # Try harder
+        for proc in self._editors.values():
+            proc.kill()
+
 
 def main():
     with INotify() as ino, TmpManager() as tmp_mgr:
@@ -72,6 +86,7 @@ def main():
         loop.add_reader(sys.stdin.buffer, handle_stdin, tmp_mgr)
         loop.add_reader(ino.fd, handle_inotify_event, ino, tmp_mgr)
         loop.run_forever()
+        tmp_mgr.kill_editors()
         loop.close()
 
 
@@ -151,6 +166,7 @@ async def handle_message_new_text(tmp_mgr, msg):
     except FileNotFoundError:
         send_error("could not find editor '%s'" % editor_args[0])
     else:
+        tmp_mgr.add_editor(absfn, proc)
         await proc.wait()
         if proc.returncode != 0:
             send_error("editor '%s' did not exit successfully"

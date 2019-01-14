@@ -5,13 +5,15 @@
 # Copyright (C) 2018  Oleg Broytman <phd@phdru.name>
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import asyncio
+from __future__ import print_function
 import json
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
+import threading
 import urllib.parse
 import time
 
@@ -49,6 +51,11 @@ class TmpManager():
     def __exit__(self, exc_type, exc_val, exc_tb):
         shutil.rmtree(self.tmpdir)
 
+    def __bool__(self, relfn):
+        return bool(self._tmpfiles)
+
+    __nonzero__ = __bool__  # Python 2.7
+
     def __contains__(self, relfn):
         return relfn in self._tmpfiles
 
@@ -85,6 +92,7 @@ class TmpManager():
         assert relfn in self._tmpfiles
         self._tmpfiles.pop(relfn)
         os.unlink(absfn)
+        del self._editors[absfn]
 
     def backup(self, relfn):
         if self._backupdir == "":
@@ -99,10 +107,20 @@ class TmpManager():
         with open(os.path.join(self.tmpdir, relfn), encoding='utf-8') as f:
             return f.read(), self._tmpfiles[relfn]
 
-    def add_editor(self, absfn, proc):
+    def add_editor(self, absfn, editor, id, proc):
         relfn = os.path.basename(absfn)
         assert relfn in self._tmpfiles
-        self._editors[absfn] = proc
+        self._editors[absfn] = (editor, id, proc)
+
+    def poll(self):
+        for absfn, editor, id, proc in list(self._editors.items()):
+            if proc.poll() is None:  # still running:
+                continue
+            if proc.returncode != 0:
+                send_error("editor '%s' did not exit successfully"
+                           % editor)
+            send_death_notice(id)
+            self.delete(absfn)
 
     def kill_editors_configure(self, allow, timeout):
         self.kill_editors_allow = allow
@@ -123,32 +141,36 @@ class TmpManager():
 def main():
     with INotify() as ino, TmpManager() as tmp_mgr:
         ino.add_watch(tmp_mgr.tmpdir, flags.CLOSE_WRITE)
-        loop = asyncio.get_event_loop()
-        loop.add_reader(sys.stdin.buffer, handle_stdin, tmp_mgr)
-        loop.add_reader(ino.fd, handle_inotify_event, ino, tmp_mgr)
-        loop.run_forever()
-        loop.close()
+
+        thread1 = threading.Thread(target=handle_stdin, args=(tmp_mgr,))
+        thread1.start()
+
+        thread2 = threading.Thread(target=handle_inotify_event,
+                                   args=(ino, tmp_mgr))
+        thread2.start()
+
+        sys.stdin.close()
+        thread1.join()
+        ino.close()
+        thread2.join()
         tmp_mgr.kill_editors()
 
 
 def handle_stdin(tmp_mgr):
-    # In theory, these reads could block, since we only know that there is some
-    # data, but not that all the data is there. We could be more strict here by
-    # reading in a separate thread. In practice, we're trusting that we're
-    # talking with Firefox and that readiness implies a full message (length +
-    # content) is ready to be read.
-    loop = asyncio.get_event_loop()
-    raw_length = sys.stdin.buffer.read(4)
-    if len(raw_length) == 0:
-        loop.stop()
-        return
-    length = struct.unpack('@I', raw_length)[0]
-    raw_message = sys.stdin.buffer.read(length)
-    if len(raw_message) != length:
-        raise Exception("expected %d bytes, but got %d" % (length,
-                                                           len(raw_message)))
-    message = json.loads(raw_message.decode('utf-8'))
-    loop.create_task(handle_message(tmp_mgr, message))
+    while True:
+        raw_length = sys.stdin.buffer.read(4)
+        if len(raw_length) == 0:
+            return
+        length = struct.unpack('@I', raw_length)[0]
+        raw_message = sys.stdin.buffer.read(length)
+        if len(raw_message) != length:
+            raise Exception("expected %d bytes, but got %d"
+                            % (length, len(raw_message)))
+        message = json.loads(raw_message.decode('utf-8'))
+        handle_message(tmp_mgr, message)
+        tmp_mgr.poll()
+        if not tmp_mgr:  # All editors have been closed
+            return
 
 
 def get_final_editor_args(editor_args, absfn, line, column):
@@ -172,8 +194,8 @@ def get_final_editor_args(editor_args, absfn, line, column):
     return final_editor_args
 
 
-async def handle_message(tmp_mgr, msg):
-    await message_handlers[msg["type"]](tmp_mgr, msg["payload"])
+def handle_message(tmp_mgr, msg):
+    message_handlers[msg["type"]](tmp_mgr, msg["payload"])
 
 
 def offset_to_line_and_column(text, offset):
@@ -188,7 +210,10 @@ def offset_to_line_and_column(text, offset):
     return line, column
 
 
-async def handle_message_new_text(tmp_mgr, msg):
+NULL = open(os.devnull, 'w')
+
+
+def handle_message_new_text(tmp_mgr, msg):
 
     # create a new tempfile for it
     absfn = tmp_mgr.new(msg["text"], msg["url"],
@@ -208,22 +233,11 @@ async def handle_message_new_text(tmp_mgr, msg):
 
     editor_args = get_final_editor_args(editor_args, absfn, line, column)
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *editor_args,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-    except FileNotFoundError:
+        proc = subprocess.Popen(*editor_args, stdout=NULL, stderr=NULL)
+    except OSError:
         send_error("could not find editor '%s'" % editor_args[0])
     else:
-        tmp_mgr.add_editor(absfn, proc)
-        await proc.wait()
-        if proc.returncode != 0:
-            send_error("editor '%s' did not exit successfully"
-                       % editor_args[0])
-    finally:
-        send_death_notice(msg["id"])
-        tmp_mgr.delete(absfn)
+        tmp_mgr.add_editor(absfn, editor_args[0], msg["id"], proc)
 
 
 message_handlers = {
@@ -232,14 +246,19 @@ message_handlers = {
 
 
 def handle_inotify_event(ino, tmp_mgr):
-    for event in ino.read():
-        # this check is relevant in the case where we're handling the inotify
-        # event caused by tmp_mgr.new(), but then an exception occurred in
-        # handle_message() which caused the tmpfile to already be deleted
-        if event.name in tmp_mgr:
-            text, id = tmp_mgr.get(event.name)
-            send_text_update(id, text)
-            tmp_mgr.backup(event.name)
+    while True:
+        for event in ino.read():
+            # this check is relevant in the case where we're handling
+            # the inotify # event caused by tmp_mgr.new(),
+            # but then an exception occurred in # handle_message()
+            # which caused the tmpfile to already be deleted
+            if event.name in tmp_mgr:
+                text, id = tmp_mgr.get(event.name)
+                send_text_update(id, text)
+                tmp_mgr.backup(event.name)
+        tmp_mgr.poll()
+        if not tmp_mgr:  # All editors have been closed
+            return
 
 
 def send_text_update(id, text):
@@ -255,12 +274,6 @@ def send_error(error):
 
 
 def send_raw_message(type, payload):
-
-    # This is *also* potentially blocking, so to be more strict we'd delegate
-    # this to a thread. Though in practice, we expect Firefox to clear the pipe
-    # quickly enough.
-
-    # writing as part of the event loop here means we don't have to lock stdout
     raw_msg = json.dumps({"type": type, "payload": payload}).encode('utf-8')
     sys.stdout.buffer.write(struct.pack('@I', len(raw_msg)))
     sys.stdout.buffer.write(raw_msg)

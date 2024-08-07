@@ -161,9 +161,14 @@ feature, enter a path to the backup directory in the addon
 preferences page. Note no shell expansion is performed on
 the path (use e.g. `/home/jlebon` instead of `~`).
 
-Files older than 24 hours are deleted from the backup
-directory. Note this feature is experimental and subject to
-change.
+**All files** older than 24 hours are deleted from the
+backup directory (i.e., not just those files that Textern
+created). If there are files in the directory that Textern
+fails to delete, then Textern will misbehave. For this
+reason, make sure the backup directory is exclusively used
+by Textern.
+
+Note this feature is experimental and subject to change.
 
 ## Troubleshooting
 

@@ -81,7 +81,7 @@ smaller by one for text editors that count from zero). For
 example, passing this information to `gvim` (or `vim`):
 
 ```json
-["gvim", "-f", "+call cursor(%l,%c)"]
+["gvim", "-f", "+set nofixeol", "+call setcursorcharpos(%l, %c)"]
 ```
 
 Example for emacs:
